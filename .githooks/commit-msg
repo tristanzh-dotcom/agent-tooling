@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+subject=$(sed -n '1p' "$1")
+
+case "$subject" in
+  Merge\ *|Revert\ *) exit 0 ;;
+esac
+
+if ! printf '%s\n' "$subject" | grep -Eq '^(feat|fix|docs|chore|refactor|test|build|ci|perf|style|revert)(\([a-z0-9._-]+\))?: .{1,100}$'; then
+  echo "commit-msg: use conventional commits, e.g. fix(agent04): stabilize search order" >&2
+  exit 1
+fi

@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+max_bytes="${GIT_MAX_FILE_BYTES:-10485760}"
+failures=$(mktemp)
+trap 'rm -f "$failures"' EXIT
+
+git diff --cached --name-only --diff-filter=ACMR | while IFS= read -r path; do
+  [ -f "$path" ] || continue
+
+  size=$(wc -c < "$path" | tr -d ' ')
+  if [ "$size" -gt "$max_bytes" ]; then
+    echo "pre-commit: $path is larger than $max_bytes bytes" >&2
+    echo "$path" >> "$failures"
+  fi
+
+  case "$path" in
+    .env|.env.*|*.pem|*.key|*.p12)
+      echo "pre-commit: refusing to commit likely secret file $path" >&2
+      echo "$path" >> "$failures"
+      ;;
+  esac
+
+  if grep -Iq . "$path" && grep -E 'BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}' "$path" >/dev/null; then
+    echo "pre-commit: possible secret detected in $path" >&2
+    echo "$path" >> "$failures"
+  fi
+done
+
+if [ -s "$failures" ]; then
+  exit 1
+fi
