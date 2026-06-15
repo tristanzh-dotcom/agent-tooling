@@ -1,6 +1,7 @@
 # Project Sentinel v3 Design
 
 Date: 2026-06-14
+Last amended: 2026-06-15
 Status: Approved for specification review
 Owner: TZ
 
@@ -49,7 +50,7 @@ flowchart LR
   W --> G["TZ Gate: approve / reject"]
   G -->|reject| X["Blacklist + terminal state"]
   G -->|approve| P["Audit Prep: cleaned README / file map / selected snippets"]
-  P --> K["Token Circuit Breaker"]
+  P --> K["Pre-flight Token Estimator + Circuit Breaker"]
   K --> H["Hard-core Auditor: strong model"]
   H --> R["Audit Report + Integration Verdict"]
   E["Event Log + Checkpoint Snapshot"] <--> A
@@ -68,6 +69,7 @@ project-sentinel/
     checkpoint.json
     budget-ledger.json
     blacklist.json
+    locks/
     candidates/2026-06-14.json
     decisions/2026-06-14.json
     audits/
@@ -85,6 +87,8 @@ project-sentinel/
 ```
 
 `events.jsonl` is the durable fact log. `checkpoint.json` is a rebuildable snapshot. If they disagree, the event log wins.
+
+All JSON files in `data/` are shared local state. The dashboard, scout CLI, and audit runner must treat them as concurrently readable and writable. No component may mutate JSON files in place.
 
 ## 6. Layer 1: Blind Scout
 
@@ -137,6 +141,8 @@ Actions:
 - Reject: writes a `GateDecision` with `decision: "reject"`, updates blacklist if requested, and transitions to `rejected_terminal`.
 
 The dashboard must communicate only through local JSON contracts or local HTTP endpoints that perform schema-validated JSON file updates. There is no remote backend.
+
+Dashboard writes to `decisions/*.json`, `blacklist.json`, and state checkpoints must use the Atomic JSON Write protocol in section 12. The dashboard may read without taking a lock, but every read must tolerate the file being replaced between open and parse by retrying the read once before reporting a schema error.
 
 ## 8. Layer 3: Hard-core Auditor
 
@@ -240,6 +246,7 @@ Reject example:
 {
   "job_id": "audit:owner/repo:2026-06-14",
   "candidate_id": "github:owner/repo:2026-06-14",
+  "model_profile": "o1",
   "input_pack": {
     "readme_digest_path": "data/audits/owner-repo/readme.digest.md",
     "file_tree_path": "data/audits/owner-repo/file-tree.json",
@@ -252,6 +259,24 @@ Reject example:
     "daily_budget_key": "2026-06-14"
   },
   "state": "queued"
+}
+```
+
+### AuditTokenEstimate
+
+The audit runner must create this local estimate before any third-layer model call. It is a pre-flight input to the budget ledger, not a post-call accounting artifact.
+
+```json
+{
+  "job_id": "audit:owner/repo:2026-06-14",
+  "candidate_id": "github:owner/repo:2026-06-14",
+  "model_profile": "o1",
+  "tokenizer": "tiktoken-compatible",
+  "input_tokens_estimated": 13240,
+  "output_tokens_reserved": 4000,
+  "total_tokens_reserved": 17240,
+  "estimated_at": "2026-06-14T08:20:00+08:00",
+  "payload_sha256": "..."
 }
 ```
 
@@ -313,10 +338,17 @@ failed_terminal
 
 Only events may move state. The implementation must reject direct state mutation.
 
-## 11. Token Circuit Breaker
+## 11. Pre-flight Token Budgeting and Circuit Breaker
 
 Rules:
 
+- Strong model calls require local pre-flight token estimation before budget reservation.
+- Token estimation must use a deterministic local tokenizer compatible with the target model family, such as `tiktoken` / `js-tiktoken` for OpenAI-style models or a documented DeepSeek-compatible estimator for DeepSeek-R1.
+- The estimator must run against the exact serialized payload that would be sent to the third-layer model.
+- If the estimate exceeds `max_input_tokens`, the job fails before any network or model call.
+- If the estimate plus reserved output tokens exceeds the remaining daily budget, the job is skipped before any network or model call.
+- The budget ledger must record the pre-flight estimate, payload hash, reserved output budget, and reservation id.
+- Post-call accounting may reconcile unused reserved budget, but it is not allowed to be the first budget defense.
 - Strong model calls require a budget reservation before execution.
 - Reservation must be atomic and tied to a `job_id`.
 - If the actual token spend is lower than reserved, unused budget is reconciled.
@@ -334,7 +366,12 @@ async function runStrongAudit(job: AuditJob, ctx: RuntimeContext) {
     return;
   }
 
-  const estimated = estimateTokens(pack);
+  const payload = serializeStrongAuditPayload(pack);
+  const payloadHash = sha256(payload);
+  const estimated = estimateTokensWithLocalTokenizer({
+    model_profile: job.model_profile,
+    payload
+  });
   const budget = await loadBudgetLedger(job.budget.daily_budget_key);
 
   if (estimated.input > job.budget.max_input_tokens) {
@@ -356,7 +393,10 @@ async function runStrongAudit(job: AuditJob, ctx: RuntimeContext) {
   const reservation = await reserveBudgetAtomically({
     key: job.budget.daily_budget_key,
     job_id: job.job_id,
-    tokens: required
+    tokens: required,
+    payload_sha256: payloadHash,
+    input_tokens_estimated: estimated.input,
+    output_tokens_reserved: job.budget.max_output_tokens
   });
 
   if (!reservation.ok) return;
@@ -378,14 +418,38 @@ async function runStrongAudit(job: AuditJob, ctx: RuntimeContext) {
 }
 ```
 
-## 12. Checkpoint and Graceful Shutdown
+## 12. Atomic JSON Write, Checkpoint, and Graceful Shutdown
 
 Rules:
 
 - Append event first, then write checkpoint snapshot.
-- JSON writes use temp file, fsync, rename, and directory fsync.
+- JSON writes use temp file, fsync, operating-system-level atomic replacement, and directory fsync.
+- Writers must never overwrite JSON in place.
+- Writers must acquire a per-target-file local write lock before read-modify-write sequences to prevent lost updates between the dashboard and scout or audit processes.
+- Readers do not take locks. They only read stable target filenames and never read `.tmp` files.
 - On startup, rebuild checkpoint from event log if checkpoint is missing or invalid.
 - On `SIGINT` or `SIGTERM`, stop accepting new work, abort cancellable network calls, finish safe-point writes, clean temp sandboxes, then exit.
+
+### Atomic JSON Write Protocol
+
+This protocol applies to `checkpoint.json`, `budget-ledger.json`, `blacklist.json`, `candidates/*.json`, `decisions/*.json`, and audit report JSON files.
+
+1. Validate the next JSON object against its schema in memory.
+2. Acquire a write lock under `data/locks/` using an atomic lock operation:
+   - Node implementation: create a lock directory with `fs.mkdir(lockPath)`.
+   - Python helper implementation, if introduced later: create the lock with exclusive file creation or an equivalent atomic primitive.
+   - If the lock exists, retry with bounded exponential backoff and jitter.
+   - If a lock exceeds the configured stale-lock TTL and the owning PID is absent, mark it stale and recover through a new lock attempt.
+3. Read the current target file only after the lock is held for read-modify-write operations.
+4. Write the new JSON to a temp file in the same directory as the target, for example `checkpoint.json.<pid>.<nonce>.tmp`.
+5. Flush and fsync the temp file.
+6. Atomically replace the target path:
+   - Node implementation: `fs.rename(tmpPath, targetPath)` on the same filesystem, which maps to POSIX atomic rename semantics.
+   - Python helper implementation: `os.replace(tmp_path, target_path)`.
+7. Fsync the parent directory.
+8. Release the lock.
+
+This guarantees readers observe either the old valid JSON or the new valid JSON. They must never observe partial JSON. The write lock prevents two writers from losing each other's updates; the atomic replace prevents corrupted JSON.
 
 Pseudocode:
 
@@ -401,13 +465,29 @@ async function applyEvent(event: SentinelEvent) {
 }
 
 async function writeJsonAtomically(path: string, value: unknown) {
-  const tmp = `${path}.${Date.now()}.tmp`;
+  validateSchemaForPath(path, value);
+  const tmp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
   const bytes = JSON.stringify(value, null, 2);
 
-  await fs.writeFile(tmp, bytes, "utf8");
-  await fsyncFile(tmp);
-  await fs.rename(tmp, path);
-  await fsyncDirectory(dirname(path));
+  await withFileWriteLock(path, async () => {
+    await fs.writeFile(tmp, bytes, "utf8");
+    await fsyncFile(tmp);
+    await fs.rename(tmp, path);
+    await fsyncDirectory(dirname(path));
+  });
+}
+
+async function mutateJsonAtomically(path: string, mutator: (current: unknown) => unknown) {
+  await withFileWriteLock(path, async () => {
+    const current = await readJsonWithRetry(path);
+    const next = mutator(current);
+    validateSchemaForPath(path, next);
+    const tmp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    await fs.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    await fsyncFile(tmp);
+    await fs.rename(tmp, path);
+    await fsyncDirectory(dirname(path));
+  });
 }
 
 function installGracefulShutdown(ctx: RuntimeContext) {
@@ -471,6 +551,23 @@ The first implementation plan must start from tests for:
 6. Rejected repo or owner is filtered from future daily queues.
 7. Daily queue produces exactly five candidates when five or more valid candidates exist.
 8. Dashboard approve and reject actions write schema-valid decisions.
+
+### Offline TDD Matrix
+
+All tests in the first implementation must run without connecting to the public internet and without calling real model APIs. External boundaries must be replaced by mocks or local fixture servers.
+
+| Requirement | Offline test method | Required assertion |
+| --- | --- | --- |
+| Atomic JSON write prevents corruption | Run two concurrent writers against the same decision or blacklist JSON using temporary directories and mocked delays around lock acquisition. In the TypeScript stack use Vitest fake timers / `vi.fn`; if a Python helper is later introduced, use `pytest-mock` to patch filesystem timing. | The final file parses as valid JSON every time, contains no partial content, and no `.tmp` file is treated as authoritative. |
+| Atomic write prevents lost dashboard/scout updates | Simulate dashboard reject and scout checkpoint update attempting read-modify-write on the same file. | Both updates are present after serialized lock-protected writes, or one fails retryably without corrupting the target. |
+| Pre-flight token budgeting blocks oversized payloads | Mock the local tokenizer to return an input estimate above `max_input_tokens`. | Strong model client mock is not called, event log records `JOB_INPUT_TOKEN_LIMIT_EXCEEDED`, and no budget reservation is created. |
+| Pre-flight daily budget blocks expensive audits | Mock tokenizer estimate plus reserved output tokens above remaining daily budget. | Strong model client mock is not called, event log records `audit_skipped_budget_exhausted`, and the job remains resumable. |
+| HTTP 429 rate limit handling | Mock `fetch` / source client to return HTTP 429 for the first attempts, then success. In TypeScript use injected clients and Vitest mocks; for future Python collectors use `pytest-mock` to patch the HTTP client response. | Retry count, exponential backoff, checkpoint cursor, and final success state are deterministic under fake timers. |
+| Network failure during source fetch | Mock timeout or connection reset before metadata write. | State moves to `failed_retryable`, checkpoint remains valid, and rerun does not duplicate already completed work. |
+| `SIGTERM` during I/O | Spawn the CLI as a child process or call the signal handler through an injected runtime context; mock a long-running write or fetch. | Shutdown event is appended, AbortController is triggered, temp sandbox cleanup runs, and every JSON file still parses. |
+| `SIGINT` during audit reservation | Mock signal after budget reservation but before model call. | Unused reservation is released or marked resumable, strong model client is not called unless reservation and pre-flight checks completed. |
+| Checkpoint rebuild after partial snapshot | Write a corrupt `checkpoint.json` while leaving valid `events.jsonl`. | Startup rebuilds checkpoint from events and ignores the corrupt snapshot. |
+| Blacklist suppression | Use local fixture candidates and a local blacklist JSON. | Rejected repo or owner never appears in the next five-candidate queue. |
 
 ## 15. Approval Gate
 
